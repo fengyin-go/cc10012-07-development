@@ -3,7 +3,10 @@
     <header class="page-head">
       <div>
         <h2>聚合计算管理</h2>
-        <p class="page-desc">维护聚合计算方案的输入、执行约束与结果记录，为聚合分析提供可验证的数据工程流程。</p>
+        <p class="page-desc">
+          维护聚合方案并执行聚合：读取订单原始记录，按分组维度聚合金额，生成带窗口标识与参与记录数的聚合结果数据明细，
+          支持重试覆盖、截断留痕、排序翻页、原记录复核与下游文件导出。
+        </p>
       </div>
       <div class="page-actions">
         <button class="btn primary" type="button" @click="openCreate">登记聚合方案</button>
@@ -12,9 +15,21 @@
     </header>
 
     <div class="stat-row">
-      <article v-for="item in stats" :key="item.label" class="stat-card">
-        <span class="stat-label">{{ item.label }}</span>
-        <strong class="stat-value">{{ item.value }}</strong>
+      <article class="stat-card">
+        <span class="stat-label">聚合方案总数</span>
+        <strong class="stat-value">{{ rows.length }}</strong>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">已启用方案</span>
+        <strong class="stat-value">{{ rows.filter((row) => row.status === '已启用').length }}</strong>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">结果明细总数</span>
+        <strong class="stat-value">{{ resultTotal }}</strong>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">截断分组数</span>
+        <strong class="stat-value">{{ truncatedTotal }}</strong>
       </article>
     </div>
 
@@ -55,6 +70,7 @@
             >
               {{ action }}
             </button>
+            <button class="link primary-link" type="button" @click="openExecute(row)">执行聚合</button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -67,6 +83,28 @@
       <span>共 {{ total }} 条聚合计算记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <AggregateResultPanel
+      :plans="allPlans"
+      :windows="windows"
+      :execution-tick="executionTick"
+      @drill="openDrill"
+    />
+
+    <AggregateExecuteDialog
+      :open="dialogOpen"
+      :plan="activePlan"
+      :windows="windows"
+      @cancel="dialogOpen = false"
+      @confirm="handleExecuteConfirm"
+    />
+
+    <OrderDrillModal
+      :open="drillOpen"
+      :result="drillResult"
+      :orders="drillOrders"
+      @close="drillOpen = false"
+    />
   </section>
 </template>
 
@@ -79,25 +117,53 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/local-service'
+import {
+  availableWindows,
+  executeAggregateAsync,
+  findOrdersByIds,
+} from '@/api/aggregate-service'
+import { listAggregateResults, listTruncatedGroups } from '@/data/aggregate-store'
+import type {
+  AggregateResultRow,
+  LateOrderPolicy,
+  OrderRecord,
+} from '@/data/aggregate-types'
 import type { EntryRow } from '@/data/types'
+import AggregateExecuteDialog from './AggregateExecuteDialog.vue'
+import AggregateResultPanel from './AggregateResultPanel.vue'
+import OrderDrillModal from './OrderDrillModal.vue'
 
 const meta = moduleMeta('aggregate')
-const columns = ["方案编号", "聚合函数", "目标字段", "分组维度", "时间窗口", "筛选条件", "输出精度", "缓存时间"]
-const actions = ["提交校验", "启用方案", "停用方案"]
-const statuses = ["草稿", "待校验", "已启用", "已停用"]
-const stats = [{"label": "聚合方案总数", "value": 0}, {"label": "已启用方案", "value": 0}, {"label": "待校验方案", "value": 0}]
+const columns = ['方案编号', '聚合函数', '目标字段', '分组维度', '时间窗口', '筛选条件', '输出精度', '缓存时间']
+const actions = ['提交校验', '启用方案', '停用方案']
+const statuses = ['草稿', '待校验', '已启用', '已停用']
 
 const rows = ref<EntryRow[]>([])
+const allPlans = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+const windows = availableWindows()
+
+const dialogOpen = ref(false)
+const activePlan = ref<EntryRow | null>(null)
+const executionTick = ref(0)
+const executing = ref(false)
+
+const drillOpen = ref(false)
+const drillResult = ref<AggregateResultRow | null>(null)
+const drillOrders = ref<OrderRecord[]>([])
+
 const statusSummary = computed(() =>
   statuses.map((status: string) => ({
     status,
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
 )
+
+const resultTotal = computed(() => listAggregateResults().length)
+const truncatedTotal = computed(() => listTruncatedGroups().length)
 
 function resetFilters() {
   filters.value = {}
@@ -122,12 +188,49 @@ function runAction(action: string, row: EntryRow) {
   reload()
 }
 
+function openExecute(row: EntryRow) {
+  errorMessage.value = ''
+  activePlan.value = row
+  dialogOpen.value = true
+}
+
+async function handleExecuteConfirm(payload: { windowId: string; maxRows: number | null; latePolicy: LateOrderPolicy }) {
+  if (!activePlan.value || executing.value) {
+    return
+  }
+  executing.value = true
+  try {
+    const result = await executeAggregateAsync({
+      planId: Number(activePlan.value.id),
+      windowId: payload.windowId,
+      maxRows: payload.maxRows,
+      latePolicy: payload.latePolicy,
+    })
+    errorMessage.value = result.ok ? '' : result.message
+    if (result.ok) {
+      dialogOpen.value = false
+      executionTick.value += 1
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '聚合执行失败'
+  } finally {
+    executing.value = false
+  }
+}
+
+function openDrill(row: AggregateResultRow) {
+  drillResult.value = row
+  drillOrders.value = findOrdersByIds(row.orderIds)
+  drillOpen.value = true
+}
+
 function reload() {
   errorMessage.value = ''
   try {
     const payload = listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    allPlans.value = listEntries(meta.key).items
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '聚合计算列表读取失败'
   }
